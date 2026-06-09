@@ -6,7 +6,11 @@ from unit.path import Args
 
 
 def valid(v):
-    return v is not None and not (isinstance(v, float) and math.isnan(v)) and str(v).strip() != ""
+    return (
+        v is not None
+        and not (isinstance(v, float) and math.isnan(v))
+        and str(v).strip() != ""
+    )
 
 
 def split_vals(v):
@@ -15,26 +19,36 @@ def split_vals(v):
     return [x.strip() for x in str(v).split(",")]
 
 
-def is_mixture(name):
-    return "/" in name
-
-
 def parse_numeric(val):
     if not valid(val):
         return None
 
     s = str(val)
-
-    m = re.search(r'([+-]?\d*\.?\d+)\s*[×x*]\s*10\^?([+-]?\d+)', s)
+    # 2.23 × 10-6
+    m = re.search(r'([+-]?\d*\.?\d+)\s*[×x*]\s*10-?([+-]?\d+)', s)
     if m:
-        return float(m.group(1)) * 10 ** int(m.group(2))
-
+        return float(m.group(1)) * (10 ** (-int(m.group(2))))
+    # 2.23 × 10^6
+    m = re.search(r'([+-]?\d*\.?\d+)\s*[×x*]\s*10\^([+-]?\d+)', s)
+    if m:
+        return float(m.group(1)) * (10 ** int(m.group(2)))
+    # scientific notation
     m = re.search(r'([+-]?\d*\.?\d+[eE][+-]?\d+)', s)
     if m:
         return float(m.group(1))
-
     m = re.search(r'([+-]?\d*\.?\d+)', s)
     return float(m.group(1)) if m else None
+
+
+def extract_unit(value_str):
+    if not valid(value_str):
+        return None
+    s = str(value_str)
+    m = re.search(r'[0-9\.\-\+\s×x\*\^Ee]+(.*)', s)
+    if m:
+        unit = m.group(1).strip()
+        return unit if unit else None
+    return None
 
 
 class KGBuilder:
@@ -42,22 +56,12 @@ class KGBuilder:
     def __init__(self, uri, user, password):
         self.graph = Graph(uri, auth=(user, password))
         self.clear()
-        # self.create_indexes()
 
     def clear(self):
         self.graph.run("MATCH (n) DETACH DELETE n")
         print("Neo4j database cleared")
 
-    def create_indexes(self):
-        self.graph.run("CREATE INDEX IF NOT EXISTS FOR (g:Gas) ON (g.name)")
-        self.graph.run("CREATE INDEX IF NOT EXISTS FOR (m:Mixture) ON (m.name)")
-        self.graph.run("CREATE INDEX IF NOT EXISTS FOR (m:Membrane) ON (m.name)")
-        self.graph.run("CREATE INDEX IF NOT EXISTS FOR (m:Material) ON (m.name)")
-        self.graph.run("CREATE INDEX IF NOT EXISTS FOR (f:Filler) ON (f.name)")
-        print("Indexes created")
-
     def insert_row(self, row, row_index):
-
         material_name = row.get("Membrane Material")
         filler_name = row.get("Fill Name")
         filler_ratio = row.get("Fill Ratio")
@@ -74,47 +78,37 @@ class KGBuilder:
         else:
             return
 
+        # ------------------Material------------------
         self.graph.run("""
             MERGE (mat:Material {name:$name})
-            SET mat.filler_ratio = $ratio
+            SET mat.filler_ratio=$ratio
         """, name=final_material, ratio=ratio)
 
-        create_operation = (temperature is not None) or (pressure is not None)
-
+        # ------------------Operation------------------
+        create_operation = temperature is not None or pressure is not None
+        operation_name = None
         if create_operation:
-
             parts = []
             if temperature is not None:
                 parts.append(f"{temperature}K")
             if pressure is not None:
                 parts.append(f"{pressure}bar")
-
             operation_name = "_".join(parts)
-
             self.graph.run("""
                 MERGE (op:Operation {name:$name})
-                SET op.temperature = $temp,
-                    op.pressure = $pres
-            """, name=operation_name,
-                           temp=temperature,
-                           pres=pressure)
-
+                SET op.temperature=$temp,
+                    op.pressure=$pres
+            """, name=operation_name, temp=temperature, pres=pressure)
             self.graph.run("""
                 MATCH (mat:Material {name:$mat})
                 MATCH (op:Operation {name:$op})
                 MERGE (mat)-[:OPERATED_UNDER]->(op)
-            """, mat=final_material,
-                           op=operation_name)
+            """, mat=final_material, op=operation_name)
 
+        # ------------------Permea*------------------
         gases = split_vals(row.get("Gas"))
         permeas = split_vals(row.get("Permea*"))
-
-        mixtures = split_vals(row.get("Mixture"))
-        sels = split_vals(row.get("Selectivity"))
-
-        # ----------Single Gas----------
-        for gas, p in zip(gases, permeas):
-
+        for gas, permea in zip(gases, permeas):
             self.graph.run("""
                 MERGE (g:Gas {name:$gas})
                 WITH g
@@ -122,38 +116,40 @@ class KGBuilder:
                 MERGE (g)-[:TESTED_ON]->(mat)
             """, gas=gas, mat=final_material)
 
+            node_data = {
+                "gas": gas,
+                "value_str": permea,
+                "value": parse_numeric(permea),
+                "unit": extract_unit(permea)
+            }
+
             if create_operation:
                 self.graph.run("""
                     MATCH (op:Operation {name:$op})
-                    CREATE (perf:Performance {
+                    CREATE (p:`Permea*` {
                         gas:$gas,
-                        permeability_str:$p_str,
-                        permeability:$p_val
+                        value_str:$value_str,
+                        value:$value,
+                        unit:$unit
                     })
-                    MERGE (op)-[:HAS_PERFORMANCE]->(perf)
-                """,
-                               op=operation_name,
-                               gas=gas,
-                               p_str=p,
-                               p_val=parse_numeric(p))
+                    MERGE (op)-[:HAS_PERMEA]->(p)
+                """, op=operation_name, **node_data)
             else:
                 self.graph.run("""
                     MATCH (mat:Material {name:$mat})
-                    CREATE (perf:Performance {
+                    CREATE (p:`Permea*` {
                         gas:$gas,
-                        permeability_str:$p_str,
-                        permeability:$p_val
+                        value_str:$value_str,
+                        value:$value,
+                        unit:$unit
                     })
-                    MERGE (mat)-[:HAS_PERFORMANCE]->(perf)
-                """,
-                               mat=final_material,
-                               gas=gas,
-                               p_str=p,
-                               p_val=parse_numeric(p))
+                    MERGE (mat)-[:HAS_PERMEA]->(p)
+                """, mat=final_material, **node_data)
 
-        # ----------Gas Mixture----------
+        # ------------------Selectivity------------------
+        mixtures = split_vals(row.get("Mixture"))
+        sels = split_vals(row.get("Selectivity"))
         for mix, sel in zip(mixtures, sels):
-
             self.graph.run("""
                 MERGE (g:Gas {name:$gas})
                 WITH g
@@ -161,36 +157,33 @@ class KGBuilder:
                 MERGE (g)-[:TESTED_ON]->(mat)
             """, gas=mix, mat=final_material)
 
+            node_data = {
+                "gas": mix,
+                "value_str": sel,
+                "value": parse_numeric(sel)
+            }
+
             if create_operation:
                 self.graph.run("""
                     MATCH (op:Operation {name:$op})
-                    CREATE (perf:Performance {
+                    CREATE (p:Selectivity {
                         gas:$gas,
-                        selectivity_str:$sel_str,
-                        selectivity:$sel_val
+                        value_str:$value_str,
+                        value:$value
                     })
-                    MERGE (op)-[:HAS_PERFORMANCE]->(perf)
-                """,
-                               op=operation_name,
-                               gas=mix,
-                               sel_str=sel,
-                               sel_val=parse_numeric(sel))
+                    MERGE (op)-[:HAS_SELECTIVITY]->(p)
+                """, op=operation_name, **node_data)
             else:
                 self.graph.run("""
                     MATCH (mat:Material {name:$mat})
-                    CREATE (perf:Performance {
+                    CREATE (p:Selectivity {
                         gas:$gas,
-                        selectivity_str:$sel_str,
-                        selectivity:$sel_val
+                        value_str:$value_str,
+                        value:$value
                     })
-                    MERGE (mat)-[:HAS_PERFORMANCE]->(perf)
-                """,
-                               mat=final_material,
-                               gas=mix,
-                               sel_str=sel,
-                               sel_val=parse_numeric(sel))
+                    MERGE (mat)-[:HAS_SELECTIVITY]->(p)
+                """, mat=final_material, **node_data)
 
-    # Batch insertion
     def insert_all(self, df):
         for i, row in df.iterrows():
             self.insert_row(row, i)
@@ -198,13 +191,11 @@ class KGBuilder:
 
 
 if __name__ == "__main__":
-
     gas_path = Args().gas
     URI = "bolt://localhost:7687"
     USER = "neo4j"
     PASSWORD = "your_password"
-    EXCEL_PATH = gas_path
-    df = pd.read_excel(EXCEL_PATH)
 
+    df = pd.read_excel(gas_path)
     kg = KGBuilder(URI, USER, PASSWORD)
     kg.insert_all(df)
