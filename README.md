@@ -15,11 +15,9 @@ Python modules（version used in this work）
 root
 |-- data        
 |   |--gas.xlsx        // Membrane gas separation data
-|   |--ion.xlsx        // Membrane ion separation data
 |   |--liquid.xlsx        // Membrane liquid separation data   
 |-- unit // Building a knowledge graph
 |   |-- neo4j-gas.py     // Building a knowledge graph for gas separation
-|   |-- neo4j-ion.py     // Building a knowledge graph for ion separation
 |   |-- neo4j-liquid.py  //  Building a knowledge graph for liquid separation
 |   |-- path.py  // Pathway 
 ```
