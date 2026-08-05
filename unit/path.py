@@ -14,7 +14,6 @@ class Args:
         self.data_path = os.path.join(self._root, 'data')
         self.unit_path = os.path.join(self._root, 'unit')
         self.gas = os.path.join(self.data_path, 'gas.xlsx')
-        self.ion = os.path.join(self.data_path, 'ion.xlsx')
         self.liquid = os.path.join(self.data_path, 'liquid.xlsx')
 
 if __name__ =='__main__':
