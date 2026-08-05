@@ -1,40 +1,7 @@
 from py2neo import Graph
 import pandas as pd
 import math
-import re
 from unit.path import Args
-
-
-def valid(v):
-    return v is not None and not (isinstance(v, float) and math.isnan(v)) and str(v).strip() != ""
-
-
-def split_vals(v):
-    if not valid(v):
-        return []
-    return [x.strip() for x in str(v).split(",")]
-
-
-def is_mixture(name):
-    return "/" in name
-
-
-def parse_numeric(val):
-    if not valid(val):
-        return None
-
-    s = str(val)
-
-    m = re.search(r'([+-]?\d*\.?\d+)\s*[×x*]\s*10\^?([+-]?\d+)', s)
-    if m:
-        return float(m.group(1)) * 10 ** int(m.group(2))
-
-    m = re.search(r'([+-]?\d*\.?\d+[eE][+-]?\d+)', s)
-    if m:
-        return float(m.group(1))
-
-    m = re.search(r'([+-]?\d*\.?\d+)', s)
-    return float(m.group(1)) if m else None
 
 
 class KGBuilder:
@@ -42,43 +9,36 @@ class KGBuilder:
     def __init__(self, uri, user, password):
         self.graph = Graph(uri, auth=(user, password))
         self.clear()
-        # self.create_indexes()
+
+    def clean_val(self, v):
+        if v is None:
+            return None
+        if pd.isna(v):
+            return None
+        v = str(v).strip()
+        if v in ["", "-", "--", "nan", "NaN"]:
+            return None
+        return v
+
+    def valid(self, v):
+        return self.clean_val(v) is not None
+
+    def split_vals(self, v):
+        v = self.clean_val(v)
+        if v is None:
+            return []
+        return [i.strip() for i in str(v).split(";") if i.strip()]
 
     def clear(self):
         self.graph.run("MATCH (n) DETACH DELETE n")
         print("Neo4j database cleared")
 
-    def clean_val(self, v):
-
-        if v is None:
-            return None
-
-        if pd.isna(v):
-            return None
-
-        v = str(v).strip()
-
-        if v in ["", "-", "--", "nan", "NaN"]:
-            return None
-
-        return v
-
-    def valid(self, v):
-
-        return self.clean_val(v) is not None
-
-    def split_vals(self, v):
-
-        v = self.clean_val(v)
-
-        if v is None:
-            return []
-
-        return [i.strip() for i in str(v).split(";") if i.strip()]
-
     def insert_row(self, row, idx):
 
         component = self.clean_val(row.get("Separation_Component"))
+
+        if component and component.lower() == "water":
+            return
 
         material = self.clean_val(row.get("Membrane_Materials"))
         filler = self.clean_val(row.get("Fillers"))
@@ -96,20 +56,16 @@ class KGBuilder:
         ph = self.clean_val(row.get("pH"))
         conc = self.clean_val(row.get("Concentration"))
 
-        permeances = self.split_vals(row.get("Permeance"))
-        fluxes = self.split_vals(row.get("Flux"))
+        transport_perf = self.clean_val(row.get("Transport performance"))
+        transport_metric = self.clean_val(row.get("Transport metric"))
+
         sels = self.split_vals(row.get("Selectivity"))
 
         self.graph.run("""
-        MERGE (m:Material {name:$name})
+            MERGE (m:Material {name:$name})
         """, name=final_material)
 
-        create_operation = any([
-            self.valid(temp),
-            self.valid(press),
-            self.valid(ph),
-            self.valid(conc)
-        ])
+        create_operation = any([self.valid(temp), self.valid(press), self.valid(ph), self.valid(conc)])
 
         if create_operation:
             self.graph.run("""
@@ -140,82 +96,52 @@ class KGBuilder:
                            ph=ph,
                            conc=conc)
 
-        for permeance in permeances:
-
-            self.graph.run("""
-            CREATE (p:Permeance {value:$val})
-            """, val=permeance)
-
-            if create_operation:
-
-                self.graph.run("""
-                MATCH (o:Operation {
-                    temperature:$temp,
-                    pressure:$press,
-                    ph:$ph,
-                    concentration:$conc
-                })
-                MATCH (p:Permeance {value:$val})
-                MERGE (o)-[:HAS_PERMEANCE]->(p)
-                """,
-                               temp=temp,
-                               press=press,
-                               ph=ph,
-                               conc=conc,
-                               val=permeance)
-
+        if self.valid(transport_metric) and self.valid(transport_perf):
+            metric_lower = transport_metric.lower()
+            if metric_lower == "permeance":
+                label = "Permeance"
+            elif metric_lower == "flux":
+                label = "Flux"
             else:
+                label = None  
 
-                self.graph.run("""
-                MATCH (m:Material {name:$mat})
-                MATCH (p:Permeance {value:$val})
-                MERGE (m)-[:HAS_PERMEANCE]->(p)
-                """,
-                               mat=final_material,
-                               val=permeance)
+            if label:
+                perf_vals = self.split_vals(transport_perf)
+                for perf_val in perf_vals:
+                    self.graph.run(f"""
+                    CREATE (p:{label} {{value:$val}})
+                    """, val=perf_val)
 
-        for flux in fluxes:
-
-            self.graph.run("""
-            CREATE (f:Flux {value:$val})
-            """, val=flux)
-
-            if create_operation:
-
-                self.graph.run("""
-                MATCH (o:Operation {
-                    temperature:$temp,
-                    pressure:$press,
-                    ph:$ph,
-                    concentration:$conc
-                })
-                MATCH (f:Flux {value:$val})
-                MERGE (o)-[:HAS_FLUX]->(f)
-                """,
-                               temp=temp,
-                               press=press,
-                               ph=ph,
-                               conc=conc,
-                               val=flux)
-
-            else:
-
-                self.graph.run("""
-                MATCH (m:Material {name:$mat})
-                MATCH (f:Flux {value:$val})
-                MERGE (m)-[:HAS_FLUX]->(f)
-                """,
-                               mat=final_material,
-                               val=flux)
-
+                    if create_operation:
+                        self.graph.run(f"""
+                        MATCH (o:Operation {{
+                            temperature:$temp,
+                            pressure:$press,
+                            ph:$ph,
+                            concentration:$conc
+                        }})
+                        MATCH (p:{label} {{value:$val}})
+                        MERGE (o)-[:HAS_{label.upper()}]->(p)
+                        """,
+                                       temp=temp,
+                                       press=press,
+                                       ph=ph,
+                                       conc=conc,
+                                       val=perf_val)
+                    else:
+                        self.graph.run(f"""
+                        MATCH (m:Material {{name:$mat}})
+                        MATCH (p:{label} {{value:$val}})
+                        MERGE (m)-[:HAS_{label.upper()}]->(p)
+                        """,
+                                       mat=final_material,
+                                       val=perf_val)
         for sel in sels:
-
             self.graph.run("""
             CREATE (s:Selectivity {value:$val})
             """, val=sel)
 
             if create_operation:
-
                 self.graph.run("""
                 MATCH (o:Operation {
                     temperature:$temp,
@@ -231,9 +157,7 @@ class KGBuilder:
                                ph=ph,
                                conc=conc,
                                val=sel)
-
             else:
-
                 self.graph.run("""
                 MATCH (m:Material {name:$mat})
                 MATCH (s:Selectivity {value:$val})
@@ -242,7 +166,7 @@ class KGBuilder:
                                mat=final_material,
                                val=sel)
 
-        if self.valid(component):
+        if component:
             self.graph.run("""
             MERGE (c:Component {name:$comp})
             """, comp=component)
